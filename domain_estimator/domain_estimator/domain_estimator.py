@@ -16,20 +16,93 @@ import matplotlib.pyplot as plt
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
-
+from sensor_msgs.msg import Image, CompressedImage, CameraInfo
+from cv_bridge import CvBridge
 
 class domain_estimator(Node):
     def __init__(self):
+        
         super().__init__("domain_estimator_node")
-        self.publisher_ = self.create_publisher(String, 'estimated_domain', 10)
+        self.publisher_ = self.create_publisher(String, "/estimated_domain", 10)
         self.timer = self.create_timer(0.5, self.timer_callback)
+        self.image_sub = self.create_subscription(
+            Image, "/camera/camera/color/image_raw", self.image_cb, 10
+        )
+        self.camera_param_sub = self.create_subscription(
+            CameraInfo, "/camera/camera/color/camera_info", self.camera_param_cb, 10
+        )
+        self.bridge = CvBridge()
+        # self.shared_data = shared_data  
+        
+        # 設定
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        snapshot_path = 'snapshot/2024-11-27/extra_triplet_margin_1.0-005.pt'
+        dataset_names = ['parking', 'sakaki', 'DomG', 'grass', 'parkingNocar', 'hallway','road']
+
+        # モデルと特徴量のロード
+        self.net = load_model(snapshot_path, device=self.device)
+        self.features = load_features(dataset_names)
+
+        
+        
+    def image_cb(self, msg: Image):
+        """Image sub callback
+
+        Args:
+            msg (sensor_msgs.msg.Image): Image data
+        """
+        self.image =  self.bridge.imgmsg_to_cv2(msg, "rgb8")
+        
+    def camera_param_cb(self, msg: CameraInfo):
+        """CameraInfo sub callback
+
+        Args:
+            msg (CameraInfo): to get camera internal params
+        """
+        self.internal_param = msg.k
+                
     
     def timer_callback(self):
         msg = String()
-        msg.data = 'Hello, ROS 2!'
+        
+        # 画像の前処理設定
+        self.transform_test = transforms.Compose([
+            transforms.Resize((720, 1280)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
+        # # RealSense パイプラインの初期化
+        # self.pipeline = init_realsense()
+        
+        # スレッド停止イベント
+        stop_event = threading.Event()
+
+        # 共有データ
+        shared_data = SharedData()
+        
+        # ROSノードの作成
+        # domain_estimator_node = domain_estimator(shared_data)
+
+        # # 可視化スレッドの開始
+        # vis_thread = threading.Thread(target=visualize_features, args=(shared_data, features, dataset_names, stop_event))
+        # vis_thread.start()
+
+        # 表示と評価スレッドを開始
+        #display_thread = threading.Thread(target=capture_and_display, args=(stop_event))
+        evaluation_loop(self.image, self.net, self.features, self.transform_test, self.device, shared_data, stop_event)
+        #display_thread.start()
+        #eval_thread.start()
+
+        # スレッドの終了を待機
+        #display_thread.join()
+        #eval_thread.join()
+            
+            
+        with self.shared_data.lock:
+            msg.data = self.shared_data.closest_dataset or "No valid datasets"
         self.publisher_.publish(msg)
         self.get_logger().info(f'Publishing: "{msg.data}"')
-        
 
 # MarketNet の定義
 class MarketNet(nn.Module):
@@ -63,7 +136,9 @@ class MarketNet(nn.Module):
 class SharedData:
     def __init__(self):
         self.input_feature = None  # 最新の入力画像の特徴量
+        self.closest_dataset = None  # 現在の最も近いデータセット
         self.lock = threading.Lock()  # スレッド間の同期用ロック
+
 
 
 # RealSense カメラを初期化
@@ -143,17 +218,17 @@ def evaluate_image(image, model, features, transform, device):
 
 
 # 評価ループ
-def evaluation_loop(pipeline, model, features, transform, device, shared_data, stop_event):
+def evaluation_loop(input_image, model, features, transform, device, shared_data, stop_event):
     while not stop_event.is_set():
-        # RealSenseから最新フレームを取得
-        frames = pipeline.wait_for_frames()
-        color_frame = frames.get_color_frame()
-        if not color_frame:
-            continue
-        realsense_image = np.asanyarray(color_frame.get_data())
+        # # RealSenseから最新フレームを取得
+        # frames = pipeline.wait_for_frames()
+        # color_frame = frames.get_color_frame()
+        # if not color_frame:
+        #     continue
+        # realsense_image = np.asanyarray(color_frame.get_data())
 
         # PIL イメージに変換
-        image = Image.fromarray(realsense_image)
+        image = Image.fromarray(input_image)
 
         # 評価
         input_feature, distances = evaluate_image(image, model, features, transform, device)
@@ -162,17 +237,25 @@ def evaluation_loop(pipeline, model, features, transform, device, shared_data, s
         print("\nDistances to datasets:")
         for dataset_name, distance in distances.items():
             print(f"{dataset_name}: {distance:.4f}")
+            
+        msg = String()
 
         # 最も近いデータセットを特定
         if distances:
             closest_dataset = min(distances, key=distances.get)
             print(f"\nClosest dataset: {closest_dataset} with distance: {distances[closest_dataset]:.4f}")
+            msg.data = closest_dataset
+            shared_data.closest_dataset = closest_dataset  # shared_dataに保存
         else:
             print("No valid datasets found for comparison.")
+            msg.data = "No valid datasets"
+            shared_data.closest_dataset = "No valid datasets"
+
 
         # 特徴量を共有データに保存
         with shared_data.lock:
             shared_data.input_feature = input_feature
+            
 
         time.sleep(1)  # 10秒待機
 
@@ -229,52 +312,40 @@ def visualize_features(shared_data, features, dataset_names, stop_event):
             print(f"Visualization error: {e}")
             break
         
-# メイン処理
-if __name__ == "__main__":
-    try:
-        # 設定
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        snapshot_path = 'snapshot/2024-11-27/extra_triplet_margin_1.0-005.pt'
-        dataset_names = ['parking', 'sakaki', 'DomG', 'grass', 'parkingNocar', 'hallway','road']
+# # メイン処理
+# if __name__ == "__main__":
+    
+    
 
-        # モデルと特徴量のロード
-        net = load_model(snapshot_path, device=device)
-        features = load_features(dataset_names)
+#     # スレッド停止イベント
+#     stop_event = threading.Event()
 
-        # 画像の前処理設定
-        transform_test = transforms.Compose([
-            transforms.Resize((720, 1280)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
+#     # 共有データ
+#     shared_data = SharedData()
+    
+#     # ROSノードの作成
+#     domain_estimator_node = domain_estimator(shared_data)
 
-        # RealSense パイプラインの初期化
-        pipeline = init_realsense()
+#     # # 可視化スレッドの開始
+#     # vis_thread = threading.Thread(target=visualize_features, args=(shared_data, features, dataset_names, stop_event))
+#     # vis_thread.start()
 
-        # スレッド停止イベント
-        stop_event = threading.Event()
+#     # 表示と評価スレッドを開始
+#     display_thread = threading.Thread(target=capture_and_display, args=(pipeline, stop_event))
+#     eval_thread = threading.Thread(target=evaluation_loop, args=(pipeline, net, features, transform_test, device, shared_data, stop_event))
+#     display_thread.start()
+#     eval_thread.start()
 
-        # 共有データ
-        shared_data = SharedData()
-
-        # # 可視化スレッドの開始
-        # vis_thread = threading.Thread(target=visualize_features, args=(shared_data, features, dataset_names, stop_event))
-        # vis_thread.start()
-
-        # 表示と評価スレッドを開始
-        display_thread = threading.Thread(target=capture_and_display, args=(pipeline, stop_event))
-        eval_thread = threading.Thread(target=evaluation_loop, args=(pipeline, net, features, transform_test, device, shared_data, stop_event))
-        display_thread.start()
-        eval_thread.start()
-
-        # スレッドの終了を待機
-        display_thread.join()
-        eval_thread.join()
-
-    except KeyboardInterrupt:
-        print("停止: 評価ループを終了しました。")
-        stop_event.set()
-    except Exception as e:
-        print(f"An error occurred: {e}")
-    finally:
-        cv2.destroyAllWindows()
+#     # スレッドの終了を待機
+#     display_thread.join()
+#     eval_thread.join()
+        
+#     try:
+#         rclpy.spin(domain_estimator_node)  # ROSノードをスピン
+#     except KeyboardInterrupt:
+#         print("停止: 評価ループを終了します。")
+#         stop_event.set()
+#     finally:
+#         eval_thread.join()
+#         rclpy.shutdown()  # ROS2の終了処理
+#         cv2.destroyAllWindows()
